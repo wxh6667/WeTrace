@@ -22,6 +22,27 @@ jobs:
         with:
           channel: stable
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.0"
+
+      - name: Install w64devkit
+        shell: pwsh
+        run: |
+          $version = "1.22.0"
+          $zip = "w64devkit-$version.zip"
+          $url = "https://github.com/skeeto/w64devkit/releases/download/v$version/$zip"
+          curl.exe -L --fail --retry 3 --connect-timeout 30 -o $zip $url
+          tar -xf $zip
+          "$pwd\w64devkit\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Build Go decrypt DLL
+        shell: cmd
+        run: |
+          set "CC=%CD%\w64devkit\bin\gcc.exe"
+          set "GOPROXY=https://goproxy.cn,direct"
+          call go_decrypt\build.bat
+
       - run: flutter clean
       - run: flutter pub get
       - run: flutter build windows --release
