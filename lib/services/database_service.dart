@@ -2,6 +2,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:crypto/crypto.dart';
@@ -3624,6 +3625,78 @@ class DatabaseService {
     _cachedMessageDbPaths = messageDbs.toList();
     _messageDbCacheTime = DateTime.now();
     return messageDbs;
+  }
+
+  Future<Uint8List?> fetchVoiceDataByMsgSvrId(int msgSvrId) async {
+    if (msgSvrId == 0) return null;
+
+    final mediaDbs = await _findAllMediaDbs();
+    for (final dbPath in mediaDbs) {
+      Database? db;
+      try {
+        db = await _currentFactory.openDatabase(
+          dbPath,
+          options: OpenDatabaseOptions(readOnly: true, singleInstance: false),
+        );
+        final rows = await db.rawQuery(
+          'SELECT Buf FROM Media WHERE Reserved0 = ? LIMIT 1',
+          [msgSvrId],
+        );
+        if (rows.isEmpty) continue;
+
+        final raw = rows.first['Buf'];
+        if (raw is Uint8List) return raw;
+        if (raw is List<int>) return Uint8List.fromList(raw);
+      } catch (e) {
+        await logger.warning(
+          'DatabaseService',
+          '读取语音数据失败: ${PathUtils.escapeForLog(dbPath)}',
+          e,
+        );
+      } finally {
+        await db?.close();
+      }
+    }
+
+    return null;
+  }
+
+  Future<List<String>> _findAllMediaDbs() async {
+    final mediaDbs = <String>[];
+
+    Future<void> scanDir(Directory dir) async {
+      if (!await dir.exists()) return;
+      await for (final entity in dir.list(followLinks: false)) {
+        if (entity is! File) continue;
+        final name = PathUtils.basename(entity.path).toLowerCase();
+        final isMediaDb =
+            (name.startsWith('media_') && name.endsWith('.db')) ||
+            (name.startsWith('mediamsg') && name.endsWith('.db'));
+        if (isMediaDb) {
+          mediaDbs.add(PathUtils.normalizeDatabasePath(entity.path));
+        }
+      }
+    }
+
+    if (_sessionDbPath != null) {
+      final wxidDir = _findWxidDirFromPath(_sessionDbPath!);
+      if (wxidDir != null) {
+        await scanDir(wxidDir);
+        if (mediaDbs.isNotEmpty) return mediaDbs;
+      }
+    }
+
+    final documentsDir = await getApplicationDocumentsDirectory();
+    final WeTraceDir = Directory(PathUtils.join(documentsDir.path, 'WeTrace'));
+    if (!await WeTraceDir.exists()) return mediaDbs;
+
+    await for (final entity in WeTraceDir.list(followLinks: false)) {
+      if (entity is Directory) {
+        await scanDir(entity);
+      }
+    }
+
+    return mediaDbs;
   }
 
   Future<String?> _locateMessageDbPathNearSession() async {

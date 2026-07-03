@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'dart:convert';
 import 'dart:typed_data';
+import 'package:flutter/services.dart';
 import 'package:syncfusion_flutter_xlsio/xlsio.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -15,6 +16,9 @@ import 'logger_service.dart';
 class ChatExportService {
   final DatabaseService _databaseService;
   final Set<String> _missingDisplayNameLog = <String>{};
+  static const int _voiceSampleRate = 24000;
+  static const String _silkDecoderAsset = 'assets/silk_v3_decoder.exe';
+  static const String _silkDecoderFileName = 'wetrace_silk_v3_decoder.exe';
   static final RegExp _invalidXmlChars = RegExp(
     r'[\x00-\x08\x0B\x0C\x0E-\x1F]',
   );
@@ -170,16 +174,6 @@ class ChatExportService {
           : <String, String>{};
       final myDisplayName = await _buildMyDisplayName(rawMyWxid, myContactInfo);
 
-      final html = _generateHtml(
-        session,
-        messages,
-        senderDisplayNames,
-        myWxid,
-        contactInfo,
-        myContactInfo,
-        myDisplayName,
-      );
-
       if (filePath == null) {
         final suggestedName =
             '${session.displayName ?? session.username}_聊天记录_${DateTime.now().millisecondsSinceEpoch}.html';
@@ -190,6 +184,22 @@ class ChatExportService {
         if (outputFile == null) return false;
         filePath = outputFile;
       }
+
+      final voiceAudioSources = await _exportSelfSentVoiceAudio(
+        messages,
+        filePath,
+      );
+
+      final html = _generateHtml(
+        session,
+        messages,
+        senderDisplayNames,
+        myWxid,
+        contactInfo,
+        myContactInfo,
+        myDisplayName,
+        voiceAudioSources,
+      );
 
       final file = File(filePath);
       // 确保父目录存在
@@ -528,6 +538,7 @@ class ChatExportService {
     Map<String, String> contactInfo,
     Map<String, String> myContactInfo,
     String myDisplayName,
+    Map<String, String> voiceAudioSources,
   ) {
     final buffer = StringBuffer();
 
@@ -557,6 +568,7 @@ class ChatExportService {
             '${msgDate.hour.toString().padLeft(2, '0')}:${msgDate.minute.toString().padLeft(2, '0')}:${msgDate.second.toString().padLeft(2, '0')}',
         'isSend': isSend,
         'content': msg.displayContent,
+        'audioSrc': voiceAudioSources[_messageAudioKey(msg)],
         'senderName': senderName,
         'timestamp': msg.createTime,
       };
@@ -698,6 +710,14 @@ class ChatExportService {
     buffer.writeln('      content.className = "content";');
     buffer.writeln('      content.textContent = msg.content;');
     buffer.writeln('      bubble.appendChild(content);');
+    buffer.writeln('      if (msg.audioSrc) {');
+    buffer.writeln('        const audio = document.createElement("audio");');
+    buffer.writeln('        audio.className = "voice-audio";');
+    buffer.writeln('        audio.controls = true;');
+    buffer.writeln('        audio.preload = "metadata";');
+    buffer.writeln('        audio.src = msg.audioSrc;');
+    buffer.writeln('        bubble.appendChild(audio);');
+    buffer.writeln('      }');
     buffer.writeln('      ');
     buffer.writeln('      const time = document.createElement("div");');
     buffer.writeln('      time.className = "time";');
@@ -860,6 +880,155 @@ class ChatExportService {
 
     return buffer.toString();
   }
+
+  Future<Map<String, String>> _exportSelfSentVoiceAudio(
+    List<Message> messages,
+    String htmlFilePath,
+  ) async {
+    final result = <String, String>{};
+    if (!Platform.isWindows) return result;
+
+    final htmlFile = File(htmlFilePath);
+    final htmlBaseName = PathUtils.basename(htmlFilePath).replaceFirst(
+      RegExp(r'\.html$', caseSensitive: false),
+      '',
+    );
+    final audioDirName = '${htmlBaseName}_audio';
+    final audioDir = Directory(
+      PathUtils.join(htmlFile.parent.path, audioDirName),
+    );
+
+    for (final msg in messages) {
+      if (msg.isSend != 1 || !msg.isVoiceMessage || msg.serverId == 0) {
+        continue;
+      }
+
+      final fileName = 'voice_${msg.serverId}.wav';
+      final outputFile = File(PathUtils.join(audioDir.path, fileName));
+      final relativePath = '$audioDirName/$fileName';
+
+      if (await outputFile.exists()) {
+        result[_messageAudioKey(msg)] = relativePath;
+        continue;
+      }
+
+      Directory? tempDir;
+      try {
+        final voiceData = await _databaseService.fetchVoiceDataByMsgSvrId(
+          msg.serverId,
+        );
+        if (voiceData == null || voiceData.isEmpty) {
+          await logger.warning(
+            'ChatExportService',
+            '未找到自发送语音数据: msgSvrId=${msg.serverId}',
+          );
+          continue;
+        }
+
+        if (!await audioDir.exists()) {
+          await audioDir.create(recursive: true);
+        }
+
+        final decoder = await _ensureSilkDecoder();
+        tempDir = await Directory.systemTemp.createTemp('wetrace_voice_');
+        final silkFile = File(
+          PathUtils.join(tempDir.path, '${msg.serverId}.silk'),
+        );
+        final pcmFile = File(
+          PathUtils.join(tempDir.path, '${msg.serverId}.pcm'),
+        );
+
+        await silkFile.writeAsBytes(voiceData, flush: true);
+        final decodeResult = await Process.run(
+          decoder.path,
+          [silkFile.path, pcmFile.path, '-Fs_API', '$_voiceSampleRate'],
+          workingDirectory: decoder.parent.path,
+        );
+        if (decodeResult.exitCode != 0 || !await pcmFile.exists()) {
+          throw Exception(
+            decodeResult.stderr?.toString() ?? 'silk decode failed',
+          );
+        }
+
+        final pcmBytes = await pcmFile.readAsBytes();
+        await outputFile.writeAsBytes(
+          _buildWavBytes(pcmBytes, sampleRate: _voiceSampleRate),
+          flush: true,
+        );
+
+        result[_messageAudioKey(msg)] = relativePath;
+
+      } catch (e, stackTrace) {
+        await logger.warning(
+          'ChatExportService',
+          '自发送语音转码失败: msgSvrId=${msg.serverId}, stackTrace=$stackTrace',
+          e,
+        );
+      } finally {
+        if (tempDir != null) {
+          try {
+            await tempDir.delete(recursive: true);
+          } catch (_) {}
+        }
+      }
+    }
+
+    return result;
+  }
+
+  Future<File> _ensureSilkDecoder() async {
+    final decoder = File(PathUtils.join(
+      Directory.systemTemp.path,
+      _silkDecoderFileName,
+    ));
+    if (await decoder.exists() && await decoder.length() > 0) {
+      return decoder;
+    }
+
+    final data = await rootBundle.load(_silkDecoderAsset);
+    await decoder.writeAsBytes(
+      data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
+      flush: true,
+    );
+    return decoder;
+  }
+
+  Uint8List _buildWavBytes(
+    Uint8List pcmBytes, {
+    required int sampleRate,
+    int channels = 1,
+    int bitsPerSample = 16,
+  }) {
+    final byteRate = sampleRate * channels * bitsPerSample ~/ 8;
+    final blockAlign = channels * bitsPerSample ~/ 8;
+    final output = Uint8List(44 + pcmBytes.length);
+    final data = ByteData.view(output.buffer);
+
+    void writeAscii(int offset, String value) {
+      for (var i = 0; i < value.length; i++) {
+        output[offset + i] = value.codeUnitAt(i);
+      }
+    }
+
+    writeAscii(0, 'RIFF');
+    data.setUint32(4, 36 + pcmBytes.length, Endian.little);
+    writeAscii(8, 'WAVE');
+    writeAscii(12, 'fmt ');
+    data.setUint32(16, 16, Endian.little);
+    data.setUint16(20, 1, Endian.little);
+    data.setUint16(22, channels, Endian.little);
+    data.setUint32(24, sampleRate, Endian.little);
+    data.setUint32(28, byteRate, Endian.little);
+    data.setUint16(32, blockAlign, Endian.little);
+    data.setUint16(34, bitsPerSample, Endian.little);
+    writeAscii(36, 'data');
+    data.setUint32(40, pcmBytes.length, Endian.little);
+    output.setRange(44, output.length, pcmBytes);
+    return output;
+  }
+
+  String _messageAudioKey(Message message) =>
+      '${message.localId}:${message.serverId}:${message.createTime}';
 
   String _sanitizeForExcel(String? value) {
     if (value == null || value.isEmpty) {
@@ -1479,6 +1648,14 @@ class ChatExportService {
         word-wrap: break-word;
         white-space: pre-wrap;
         letter-spacing: 0.2px;
+      }
+
+      .voice-audio {
+        display: block;
+        width: 240px;
+        max-width: 100%;
+        height: 36px;
+        margin-top: 8px;
       }
       
       .time {

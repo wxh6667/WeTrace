@@ -100,10 +100,15 @@ class Message {
     }
 
     final localType = intValue(['local_type', 'type', 'localType']);
+    final resolvedLocalType = localType != 0
+        ? localType
+        : intValue(['Type', 'msg_type', 'MsgType']);
     final messageContent = stringValue([
       'message_content',
       'WCDB_CT_message_content',
       'content',
+      'StrContent',
+      'DisplayContent',
     ]);
 
     // 步骤1：处理compress_content - 检查是否为blob格式
@@ -135,6 +140,7 @@ class Message {
     final compressContentRaw =
         map['compress_content'] ??
         map['WCDB_CT_compress_content'] ??
+        map['CompressContent'] ??
         map['WCDB_CT_message_content'];
 
     actualContent = decodeMaybeCompressed(compressContentRaw);
@@ -149,7 +155,7 @@ class Message {
     // 步骤2：根据localType解析内容
     final parsedContent = _parseMessageContent(
       actualContent,
-      localType,
+      resolvedLocalType,
       messageContent,
       myWxid,
       senderUsername: senderUsername.isEmpty ? null : senderUsername,
@@ -159,18 +165,18 @@ class Message {
 
     // 提取图片MD5（如果是图片消息）
     String? imageMd5;
-    if (localType == 3 && actualContent.isNotEmpty) {
+    if (resolvedLocalType == 3 && actualContent.isNotEmpty) {
       imageMd5 = _extractImageMd5(actualContent);
     }
 
     // 提取拍一拍消息信息
     Map<String, dynamic>? patInfo;
-    if (localType == 266287972401 && actualContent.isNotEmpty) {
+    if (resolvedLocalType == 266287972401 && actualContent.isNotEmpty) {
       patInfo = XmlMessageParser.parsePatMessageInfo(actualContent);
     }
 
     // 系统/拍一拍消息不归属于任何一方，避免被归类为自己发送
-    if (localType == 10000 || localType == 266287972401) {
+    if (resolvedLocalType == 10000 || resolvedLocalType == 266287972401) {
       isSendVal = null;
     }
 
@@ -183,11 +189,11 @@ class Message {
 
     return Message(
       localId: intValue(['local_id']),
-      serverId: intValue(['server_id']),
-      localType: localType,
+      serverId: intValue(['server_id', 'MsgSvrID', 'msg_svr_id', 'msgSvrId']),
+      localType: resolvedLocalType,
       sortSeq: intValue(['sort_seq']),
       realSenderId: intValue(['real_sender_id']),
-      createTime: intValue(['create_time']),
+      createTime: intValue(['create_time', 'CreateTime']),
       status: intValue(['status']),
       uploadStatus: intValue(['upload_status']),
       downloadStatus: intValue(['download_status']),
@@ -276,6 +282,15 @@ class Message {
             decodedContent.contains('<?xml'));
 
     if (isTargetMessage) {}
+
+    if (_looksLikeVoiceMessage(decodedContent) ||
+        _looksLikeVoiceMessage(originalMessageContent)) {
+      final duration = _extractDurationFromXml(
+        decodedContent.isNotEmpty ? decodedContent : originalMessageContent,
+        'voicelength',
+      );
+      return duration.isNotEmpty ? '[语音 $duration秒]' : '[语音消息]';
+    }
 
     // 根据localType返回对应的显示内容
     switch (localType) {
@@ -450,6 +465,12 @@ class Message {
     if (s.length % 4 != 0) return false;
     final b64 = RegExp(r'^[A-Za-z0-9+/=]+$');
     return b64.hasMatch(s);
+  }
+
+  static bool _looksLikeVoiceMessage(String content) {
+    if (content.isEmpty) return false;
+    final lower = content.toLowerCase();
+    return lower.contains('<voicemsg') || lower.contains('voicelength');
   }
 
   static List<int> _hexToBytes(String s) {
@@ -765,6 +786,7 @@ class Message {
       'is_sender_',
       'is_send_',
       'computed_is_send',
+      'IsSender',
     ]) {
       if (map.containsKey(key)) {
         final v = map[key];
@@ -850,7 +872,10 @@ class Message {
   bool get isImageMessage => localType == 3;
 
   /// 是否为语音消息
-  bool get isVoiceMessage => localType == 34;
+  bool get isVoiceMessage =>
+      localType == 34 ||
+      _looksLikeVoiceMessage(compressContent) ||
+      _looksLikeVoiceMessage(messageContent);
 
   /// 是否为视频消息
   bool get isVideoMessage => localType == 43;

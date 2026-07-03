@@ -123,6 +123,7 @@ flutter:
   assets:
     - assets/HarmonyOS_SansSC/
     - assets/dll/
+    - assets/silk_v3_decoder.exe
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images
