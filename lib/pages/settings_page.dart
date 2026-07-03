@@ -347,7 +347,7 @@ class _SettingsPageState extends State<SettingsPage>
     if (_keyController.text.trim().isNotEmpty) return;
 
     try {
-      _showMessage('正在自动获取微信解密密钥...', true);
+      _showMessage('正在重启微信并自动获取解密密钥...', true);
       final key = await _wxKeyService.fetchDecryptKey(
         timeout: const Duration(seconds: 30),
       );

@@ -37,7 +37,11 @@ typedef _GetWindowThreadProcessIdNative =
 typedef _GetWindowThreadProcessIdDart =
     int Function(int hwnd, Pointer<Uint32> processId);
 typedef _OpenProcessNative =
-    IntPtr Function(Uint32 desiredAccess, Int32 inheritHandle, Uint32 processId);
+    IntPtr Function(
+      Uint32 desiredAccess,
+      Int32 inheritHandle,
+      Uint32 processId,
+    );
 typedef _OpenProcessDart =
     int Function(int desiredAccess, int inheritHandle, int processId);
 typedef _QueryFullProcessImageNameNative =
@@ -56,8 +60,27 @@ typedef _QueryFullProcessImageNameDart =
     );
 typedef _CloseHandleNative = Int32 Function(IntPtr handle);
 typedef _CloseHandleDart = int Function(int handle);
+typedef _MultiByteToWideCharNative =
+    Int32 Function(
+      Uint32 codePage,
+      Uint32 flags,
+      Pointer<Int8> multiByteStr,
+      Int32 multiByteCount,
+      Pointer<Utf16> wideCharStr,
+      Int32 wideCharCount,
+    );
+typedef _MultiByteToWideCharDart =
+    int Function(
+      int codePage,
+      int flags,
+      Pointer<Int8> multiByteStr,
+      int multiByteCount,
+      Pointer<Utf16> wideCharStr,
+      int wideCharCount,
+    );
 
 class WxKeyService {
+  static const int _codePageAcp = 0;
   static const int _processQueryLimitedInformation = 0x1000;
   static final Set<int> _windowProcessIds = <int>{};
   static _IsWindowVisibleDart? _isWindowVisibleForCallback;
@@ -76,7 +99,7 @@ class WxKeyService {
   }) async {
     if (!Platform.isWindows) return null;
 
-    final pid = await _findWeixinPid();
+    final pid = await _restartWeChatAndFindPid();
     if (pid == null) return null;
 
     _loadLibrary();
@@ -176,56 +199,136 @@ class WxKeyService {
         .asFunction();
   }
 
-  Future<int?> _findWeixinPid() async {
-    final windowPid = _findMainWindowPid();
-    if (windowPid != null) return windowPid;
+  Future<int?> _restartWeChatAndFindPid() async {
+    final executablePath =
+        _findRunningWeChatExecutablePath() ?? await _findInstalledWeChatPath();
 
-    for (final imageName in ['Weixin.exe', 'WeChat.exe']) {
-      final pid = await _findPidByImageName(imageName);
+    await _killWeChatProcesses();
+
+    if (executablePath == null || !await File(executablePath).exists()) {
+      return null;
+    }
+
+    await Process.start(
+      executablePath,
+      const [],
+      mode: ProcessStartMode.detached,
+    );
+
+    return _waitForWeChatWindow(const Duration(seconds: 20));
+  }
+
+  Future<int?> _waitForWeChatWindow(Duration timeout) async {
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      final pid = _findMainWindowPid();
       if (pid != null) return pid;
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+    }
+    return null;
+  }
+
+  Future<void> _killWeChatProcesses() async {
+    for (final imageName in ['Weixin.exe', 'WeChat.exe']) {
+      await Process.run('taskkill', ['/IM', imageName, '/F'], runInShell: true);
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 600));
+  }
+
+  String? _findRunningWeChatExecutablePath() {
+    try {
+      final helpers = _loadProcessQueryHelpers();
+      final pids = _findVisibleWindowProcessIds();
+      for (final pid in pids) {
+        final imagePath = _queryProcessImagePath(
+          pid,
+          helpers.openProcess,
+          helpers.queryFullProcessImageName,
+          helpers.closeHandle,
+        );
+        if (_isWeChatImageName(p.basename(imagePath ?? ''))) {
+          return imagePath;
+        }
+      }
+    } catch (_) {
+      return null;
+    }
+    return null;
+  }
+
+  Future<String?> _findInstalledWeChatPath() async {
+    final fromRegistry = await _findWeChatPathFromRegistry();
+    if (fromRegistry != null) return fromRegistry;
+
+    final programFiles = Platform.environment['ProgramFiles'] ?? '';
+    final programFilesX86 = Platform.environment['ProgramFiles(x86)'] ?? '';
+    final candidates = <String>[
+      if (programFiles.isNotEmpty)
+        p.join(programFiles, 'Tencent', 'Weixin', 'Weixin.exe'),
+      if (programFilesX86.isNotEmpty)
+        p.join(programFilesX86, 'Tencent', 'Weixin', 'Weixin.exe'),
+      if (programFiles.isNotEmpty)
+        p.join(programFiles, 'Tencent', 'WeChat', 'WeChat.exe'),
+      if (programFilesX86.isNotEmpty)
+        p.join(programFilesX86, 'Tencent', 'WeChat', 'WeChat.exe'),
+    ];
+
+    for (final candidate in candidates) {
+      if (await File(candidate).exists()) return candidate;
+    }
+    return null;
+  }
+
+  Future<String?> _findWeChatPathFromRegistry() async {
+    final queries = [
+      ['HKCU\\Software\\Tencent\\Weixin', 'InstallPath'],
+      ['HKCU\\Software\\Tencent\\WeChat', 'InstallPath'],
+      ['HKLM\\Software\\Tencent\\Weixin', 'InstallPath'],
+      ['HKLM\\Software\\Tencent\\WeChat', 'InstallPath'],
+      ['HKLM\\Software\\WOW6432Node\\Tencent\\Weixin', 'InstallPath'],
+      ['HKLM\\Software\\WOW6432Node\\Tencent\\WeChat', 'InstallPath'],
+    ];
+
+    for (final query in queries) {
+      final result = await Process.run('reg', [
+        'query',
+        query[0],
+        '/v',
+        query[1],
+      ], runInShell: true);
+      if (result.exitCode != 0) continue;
+      final output = result.stdout?.toString() ?? '';
+      final installPath = _parseRegistryValue(output, query[1]);
+      if (installPath == null) continue;
+
+      for (final exeName in ['Weixin.exe', 'WeChat.exe']) {
+        final candidate = p.join(installPath, exeName);
+        if (await File(candidate).exists()) return candidate;
+      }
+    }
+    return null;
+  }
+
+  String? _parseRegistryValue(String output, String valueName) {
+    for (final line in const LineSplitter().convert(output)) {
+      final trimmed = line.trim();
+      if (!trimmed.toLowerCase().startsWith(valueName.toLowerCase())) continue;
+      final parts = trimmed.split(RegExp(r'\s+'));
+      if (parts.length < 3) continue;
+      return parts.sublist(2).join(' ').trim();
     }
     return null;
   }
 
   int? _findMainWindowPid() {
     try {
-      final user32 = DynamicLibrary.open('user32.dll');
-      final kernel32 = DynamicLibrary.open('kernel32.dll');
-      final enumWindows = user32
-          .lookup<NativeFunction<_EnumWindowsNative>>('EnumWindows')
-          .asFunction<_EnumWindowsDart>();
-      _isWindowVisibleForCallback = user32
-          .lookup<NativeFunction<_IsWindowVisibleNative>>('IsWindowVisible')
-          .asFunction<_IsWindowVisibleDart>();
-      _getWindowThreadProcessIdForCallback = user32
-          .lookup<NativeFunction<_GetWindowThreadProcessIdNative>>(
-            'GetWindowThreadProcessId',
-          )
-          .asFunction<_GetWindowThreadProcessIdDart>();
-      final openProcess = kernel32
-          .lookup<NativeFunction<_OpenProcessNative>>('OpenProcess')
-          .asFunction<_OpenProcessDart>();
-      final queryFullProcessImageName = kernel32
-          .lookup<NativeFunction<_QueryFullProcessImageNameNative>>(
-            'QueryFullProcessImageNameW',
-          )
-          .asFunction<_QueryFullProcessImageNameDart>();
-      final closeHandle = kernel32
-          .lookup<NativeFunction<_CloseHandleNative>>('CloseHandle')
-          .asFunction<_CloseHandleDart>();
-
-      _windowProcessIds.clear();
-      enumWindows(
-        Pointer.fromFunction<_EnumWindowsProcNative>(_enumWindowsProc, 1),
-        0,
-      );
-
-      for (final pid in _windowProcessIds) {
+      final helpers = _loadProcessQueryHelpers();
+      for (final pid in _findVisibleWindowProcessIds()) {
         final imageName = _queryProcessImageName(
           pid,
-          openProcess,
-          queryFullProcessImageName,
-          closeHandle,
+          helpers.openProcess,
+          helpers.queryFullProcessImageName,
+          helpers.closeHandle,
         );
         if (_isWeChatImageName(imageName)) {
           return pid;
@@ -233,12 +336,53 @@ class WxKeyService {
       }
     } catch (_) {
       return null;
+    }
+    return null;
+  }
+
+  _ProcessQueryHelpers _loadProcessQueryHelpers() {
+    final kernel32 = DynamicLibrary.open('kernel32.dll');
+    return _ProcessQueryHelpers(
+      openProcess: kernel32
+          .lookup<NativeFunction<_OpenProcessNative>>('OpenProcess')
+          .asFunction<_OpenProcessDart>(),
+      queryFullProcessImageName: kernel32
+          .lookup<NativeFunction<_QueryFullProcessImageNameNative>>(
+            'QueryFullProcessImageNameW',
+          )
+          .asFunction<_QueryFullProcessImageNameDart>(),
+      closeHandle: kernel32
+          .lookup<NativeFunction<_CloseHandleNative>>('CloseHandle')
+          .asFunction<_CloseHandleDart>(),
+    );
+  }
+
+  List<int> _findVisibleWindowProcessIds() {
+    final user32 = DynamicLibrary.open('user32.dll');
+    final enumWindows = user32
+        .lookup<NativeFunction<_EnumWindowsNative>>('EnumWindows')
+        .asFunction<_EnumWindowsDart>();
+    _isWindowVisibleForCallback = user32
+        .lookup<NativeFunction<_IsWindowVisibleNative>>('IsWindowVisible')
+        .asFunction<_IsWindowVisibleDart>();
+    _getWindowThreadProcessIdForCallback = user32
+        .lookup<NativeFunction<_GetWindowThreadProcessIdNative>>(
+          'GetWindowThreadProcessId',
+        )
+        .asFunction<_GetWindowThreadProcessIdDart>();
+
+    try {
+      _windowProcessIds.clear();
+      enumWindows(
+        Pointer.fromFunction<_EnumWindowsProcNative>(_enumWindowsProc, 1),
+        0,
+      );
+      return _windowProcessIds.toList();
     } finally {
       _isWindowVisibleForCallback = null;
       _getWindowThreadProcessIdForCallback = null;
       _windowProcessIds.clear();
     }
-    return null;
   }
 
   static int _enumWindowsProc(int hwnd, int lParam) {
@@ -293,46 +437,37 @@ class WxKeyService {
     }
   }
 
-  Future<int?> _findPidByImageName(String imageName) async {
-    final result = await Process.run(
-      'tasklist',
-      ['/FI', 'IMAGENAME eq $imageName', '/FO', 'CSV', '/NH'],
-      runInShell: true,
-    );
-    if (result.exitCode != 0) return null;
-    final output = result.stdout?.toString() ?? '';
-    for (final line in const LineSplitter().convert(output)) {
-      final columns = _parseCsvLine(line);
-      if (columns.length < 2) continue;
-      if (columns.first.toLowerCase() != imageName.toLowerCase()) continue;
-      return int.tryParse(columns[1]);
+  String? _queryProcessImagePath(
+    int pid,
+    _OpenProcessDart openProcess,
+    _QueryFullProcessImageNameDart queryFullProcessImageName,
+    _CloseHandleDart closeHandle,
+  ) {
+    final handle = openProcess(_processQueryLimitedInformation, 0, pid);
+    if (handle == 0) return null;
+
+    final size = calloc<Uint32>();
+    final buffer = calloc<Uint16>(32768);
+    try {
+      size.value = 32768;
+      final ok = queryFullProcessImageName(
+        handle,
+        0,
+        buffer.cast<Utf16>(),
+        size,
+      );
+      if (ok == 0) return null;
+      return buffer.cast<Utf16>().toDartString();
+    } finally {
+      calloc.free(buffer);
+      calloc.free(size);
+      closeHandle(handle);
     }
-    return null;
   }
 
   bool _isWeChatImageName(String? imageName) {
     final normalized = imageName?.toLowerCase();
     return normalized == 'weixin.exe' || normalized == 'wechat.exe';
-  }
-
-  List<String> _parseCsvLine(String line) {
-    final values = <String>[];
-    final buffer = StringBuffer();
-    var quoted = false;
-
-    for (var i = 0; i < line.length; i++) {
-      final char = line[i];
-      if (char == '"') {
-        quoted = !quoted;
-      } else if (char == ',' && !quoted) {
-        values.add(buffer.toString());
-        buffer.clear();
-      } else {
-        buffer.write(char);
-      }
-    }
-    values.add(buffer.toString());
-    return values.map((value) => value.trim()).toList();
   }
 
   void _drainStatusMessages() {
@@ -361,6 +496,67 @@ class WxKeyService {
       if (byte == 0) break;
       bytes.add(byte);
     }
-    return latin1.decode(bytes).trim();
+    return _decodeSystemAnsi(bytes).trim();
   }
+
+  String _decodeSystemAnsi(List<int> bytes) {
+    if (bytes.isEmpty) return '';
+    try {
+      final kernel32 = DynamicLibrary.open('kernel32.dll');
+      final multiByteToWideChar = kernel32
+          .lookup<NativeFunction<_MultiByteToWideCharNative>>(
+            'MultiByteToWideChar',
+          )
+          .asFunction<_MultiByteToWideCharDart>();
+
+      final input = calloc<Uint8>(bytes.length);
+      try {
+        for (var i = 0; i < bytes.length; i++) {
+          input[i] = bytes[i];
+        }
+
+        final wideLength = multiByteToWideChar(
+          _codePageAcp,
+          0,
+          input.cast<Int8>(),
+          bytes.length,
+          nullptr,
+          0,
+        );
+        if (wideLength <= 0) return latin1.decode(bytes);
+
+        final output = calloc<Uint16>(wideLength + 1);
+        try {
+          final written = multiByteToWideChar(
+            _codePageAcp,
+            0,
+            input.cast<Int8>(),
+            bytes.length,
+            output.cast<Utf16>(),
+            wideLength,
+          );
+          if (written <= 0) return latin1.decode(bytes);
+          return output.cast<Utf16>().toDartString(length: written);
+        } finally {
+          calloc.free(output);
+        }
+      } finally {
+        calloc.free(input);
+      }
+    } catch (_) {
+      return latin1.decode(bytes);
+    }
+  }
+}
+
+class _ProcessQueryHelpers {
+  final _OpenProcessDart openProcess;
+  final _QueryFullProcessImageNameDart queryFullProcessImageName;
+  final _CloseHandleDart closeHandle;
+
+  const _ProcessQueryHelpers({
+    required this.openProcess,
+    required this.queryFullProcessImageName,
+    required this.closeHandle,
+  });
 }
