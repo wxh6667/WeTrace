@@ -5,9 +5,6 @@
 *.h
 *.exe
 
-# Go 模块缓存
-go.sum
-
 # IDE 文件
 .vscode/
 .idea/
@@ -16,4 +13,3 @@ go.sum
 # 临时文件
 *.log
 *.tmp
-

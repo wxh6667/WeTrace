@@ -33,6 +33,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24.0"
+          cache-dependency-path: go_decrypt/go.sum
 
       - name: Install w64devkit
         shell: pwsh

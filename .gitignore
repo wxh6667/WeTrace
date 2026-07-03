@@ -32,6 +32,7 @@ migrate_working_dir/
 .pub/
 /build/
 /coverage/
+/dist/
 
 # Symbolication related
 app.*.symbols
@@ -45,8 +46,17 @@ app.*.map.json
 /android/app/release
 
 # Go 解密模块
-go_decrypt/go.sum
 *.dylib
 *.so
 go_decrypt/*.h
 /wcdb/
+/go/
+/go*.windows-amd64.zip
+/flutter/
+/flutter_windows_*-stable.zip
+/mingw64/
+/winlibs-*.zip
+/w64devkit/
+/w64devkit-*/
+/w64devkit-*.zip
+/w64devkit-*.7z.exe
