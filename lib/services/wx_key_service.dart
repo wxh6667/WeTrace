@@ -275,12 +275,17 @@ class WxKeyService {
     if (handle == 0) return null;
 
     final size = calloc<Uint32>();
-    final buffer = calloc<Utf16>(32768);
+    final buffer = calloc<Uint16>(32768);
     try {
       size.value = 32768;
-      final ok = queryFullProcessImageName(handle, 0, buffer, size);
+      final ok = queryFullProcessImageName(
+        handle,
+        0,
+        buffer.cast<Utf16>(),
+        size,
+      );
       if (ok == 0) return null;
-      return p.basename(buffer.toDartString());
+      return p.basename(buffer.cast<Utf16>().toDartString());
     } finally {
       calloc.free(buffer);
       calloc.free(size);
