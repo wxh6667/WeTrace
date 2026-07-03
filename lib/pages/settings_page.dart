@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:provider/provider.dart';
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import '../providers/app_state.dart';
 import '../services/config_service.dart';
@@ -147,7 +148,11 @@ class _SettingsPageState extends State<SettingsPage>
       }
 
       if (candidates.length == 1) {
-        _applyDetectedWxid(candidates.first.wxid, fromPath: candidates.first.path);
+        _applyDetectedWxid(
+          candidates.first.wxid,
+          fromPath: candidates.first.path,
+        );
+        await _fillDecryptKeyFromAccountPath(candidates.first.path);
         // 若根目录框为空则填入
         if (_pathController.text.isEmpty) {
           _pathController.text = path;
@@ -166,6 +171,7 @@ class _SettingsPageState extends State<SettingsPage>
         orElse: () => candidates.first,
       );
       _applyDetectedWxid(match.wxid, fromPath: match.path);
+      await _fillDecryptKeyFromAccountPath(match.path);
       if (_pathController.text.isEmpty) {
         _pathController.text = path;
       }
@@ -312,6 +318,49 @@ class _SettingsPageState extends State<SettingsPage>
       _lastWxidPathChecked = fromPath;
       _showMessage('已从路径检测到账号: $wxid', true);
     }
+  }
+
+  Future<void> _fillDecryptKeyFromAccountPath(String accountPath) async {
+    if (_keyController.text.trim().isNotEmpty) return;
+
+    final key = await _readDecryptKeyFromAccountPath(accountPath);
+    if (key == null || !mounted || _keyController.text.trim().isNotEmpty) {
+      return;
+    }
+
+    setState(() {
+      _keyController.text = key;
+    });
+    _showMessage('已从 key_info.dat 自动填入解密密钥', true);
+  }
+
+  Future<String?> _readDecryptKeyFromAccountPath(String accountPath) async {
+    final keyInfo = File(p.join(accountPath, 'key_info.dat'));
+    if (!await keyInfo.exists()) return null;
+
+    try {
+      final bytes = await keyInfo.readAsBytes();
+      if (bytes.length == 32) {
+        return _bytesToHex(bytes);
+      }
+
+      final text = latin1.decode(bytes);
+      final match = RegExp(
+        r'(?<![0-9a-fA-F])([0-9a-fA-F]{64})(?![0-9a-fA-F])',
+      ).firstMatch(text);
+      return match?.group(1);
+    } catch (e) {
+      await logger.warning('SettingsPage', '读取 key_info.dat 失败', e);
+      return null;
+    }
+  }
+
+  String _bytesToHex(List<int> bytes) {
+    final buffer = StringBuffer();
+    for (final byte in bytes) {
+      buffer.write(byte.toRadixString(16).padLeft(2, '0'));
+    }
+    return buffer.toString();
   }
 
   Future<String?> _pickWxidCandidate(List<WxidCandidate> candidates) async {
@@ -732,10 +781,18 @@ class _SettingsPageState extends State<SettingsPage>
       }
 
       String? chosenWxid;
+      WxidCandidate? chosenCandidate;
       if (candidates.length == 1) {
-        chosenWxid = candidates.first.wxid;
+        chosenCandidate = candidates.first;
+        chosenWxid = chosenCandidate.wxid;
       } else {
         chosenWxid = await _pickWxidCandidate(candidates);
+        if (chosenWxid != null && chosenWxid.isNotEmpty) {
+          chosenCandidate = candidates.firstWhere(
+            (c) => _normalizeWxid(c.wxid) == _normalizeWxid(chosenWxid!),
+            orElse: () => candidates.first,
+          );
+        }
       }
 
       if (chosenWxid == null || chosenWxid.isEmpty) {
@@ -745,7 +802,10 @@ class _SettingsPageState extends State<SettingsPage>
         return;
       }
 
-      _applyDetectedWxid(chosenWxid);
+      _applyDetectedWxid(chosenWxid, fromPath: chosenCandidate?.path);
+      if (chosenCandidate != null) {
+        await _fillDecryptKeyFromAccountPath(chosenCandidate.path);
+      }
       _showMessage('扫描成功，已填入wxid: $chosenWxid', true);
       _logScanDetail('扫描成功，已检测到 wxid: $chosenWxid');
     } catch (e, st) {
