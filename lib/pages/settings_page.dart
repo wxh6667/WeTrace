@@ -13,6 +13,7 @@ import '../services/annual_report_cache_service.dart';
 import '../services/database_service.dart';
 import '../services/logger_service.dart';
 import '../services/wxid_scan_service.dart';
+import '../services/wx_key_service.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:path/path.dart' as p;
 import 'package:intl/intl.dart';
@@ -36,6 +37,7 @@ class _SettingsPageState extends State<SettingsPage>
   final _configService = ConfigService();
   late final DecryptService _decryptService;
   final _wxidScanService = WxidScanService();
+  final _wxKeyService = WxKeyService();
   OverlayEntry? _toastEntry;
   Timer? _toastTimer;
   AnimationController? _toastController;
@@ -107,6 +109,10 @@ class _SettingsPageState extends State<SettingsPage>
         _debugMode = debugMode;
         _showWxidInput = true; // 始终显示 wxid 输入框
       });
+
+      if ((key ?? '').isEmpty) {
+        unawaited(_fillDecryptKeyFromWeChatProcess());
+      }
     }
   }
 
@@ -323,6 +329,9 @@ class _SettingsPageState extends State<SettingsPage>
   Future<void> _fillDecryptKeyFromAccountPath(String accountPath) async {
     if (_keyController.text.trim().isNotEmpty) return;
 
+    await _fillDecryptKeyFromWeChatProcess();
+    if (_keyController.text.trim().isNotEmpty) return;
+
     final key = await _readDecryptKeyFromAccountPath(accountPath);
     if (key == null || !mounted || _keyController.text.trim().isNotEmpty) {
       return;
@@ -332,6 +341,24 @@ class _SettingsPageState extends State<SettingsPage>
       _keyController.text = key;
     });
     _showMessage('已从 key_info.dat 自动填入解密密钥', true);
+  }
+
+  Future<void> _fillDecryptKeyFromWeChatProcess() async {
+    if (_keyController.text.trim().isNotEmpty) return;
+
+    try {
+      final key = await _wxKeyService.fetchDecryptKey();
+      if (key == null || !mounted || _keyController.text.trim().isNotEmpty) {
+        return;
+      }
+
+      setState(() {
+        _keyController.text = key;
+      });
+      _showMessage('已自动获取微信解密密钥', true);
+    } catch (e) {
+      await logger.warning('SettingsPage', '自动获取微信解密密钥失败', e);
+    }
   }
 
   Future<String?> _readDecryptKeyFromAccountPath(String accountPath) async {
