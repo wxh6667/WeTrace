@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:crypto/crypto.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:zstd/zstd.dart';
 import '../models/message.dart';
 import '../models/contact.dart';
 import '../models/contact_record.dart';
@@ -3625,6 +3626,184 @@ class DatabaseService {
     _cachedMessageDbPaths = messageDbs.toList();
     _messageDbCacheTime = DateTime.now();
     return messageDbs;
+  }
+
+  Future<Uint8List?> fetchVoiceSilkData(Message message) async {
+    final fromMessageDb = await _fetchVoiceSilkDataFromMessageDbs(message);
+    if (fromMessageDb != null) return fromMessageDb;
+
+    final fromMediaDb = await fetchVoiceDataByMsgSvrId(message.serverId);
+    if (fromMediaDb == null) return null;
+    return _extractSilkPayload(fromMediaDb);
+  }
+
+  Future<Uint8List?> _fetchVoiceSilkDataFromMessageDbs(Message message) async {
+    if (message.localId == 0 && message.serverId == 0) return null;
+
+    final messageDbs = await _findAllMessageDbs();
+    for (final dbPath in messageDbs) {
+      Database? db;
+      try {
+        db = await _currentFactory.openDatabase(
+          dbPath,
+          options: OpenDatabaseOptions(readOnly: true, singleInstance: false),
+        );
+        final tables = await db.rawQuery(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'",
+        );
+
+        for (final table in tables) {
+          final tableName = table['name']?.toString();
+          if (tableName == null || tableName.isEmpty) continue;
+
+          final columns = await _getTableColumns(db, tableName);
+          final blobColumns = [
+            _findColumn(columns, ['compress_content', 'CompressContent']),
+            _findColumn(columns, ['message_content', 'StrContent']),
+            _findColumn(columns, ['packed_info_data']),
+          ].whereType<String>().toList();
+          if (blobColumns.isEmpty) continue;
+
+          final idClauses = <String>[];
+          final args = <Object?>[];
+          final localIdColumn = _findColumn(columns, ['local_id', 'localId']);
+          if (localIdColumn != null && message.localId != 0) {
+            idClauses.add('${_quoteIdentifier(localIdColumn)} = ?');
+            args.add(message.localId);
+          }
+          final serverIdColumn = _findColumn(columns, [
+            'server_id',
+            'MsgSvrID',
+            'msg_svr_id',
+          ]);
+          if (serverIdColumn != null && message.serverId != 0) {
+            idClauses.add('${_quoteIdentifier(serverIdColumn)} = ?');
+            args.add(message.serverId);
+          }
+          if (idClauses.isEmpty) continue;
+
+          final whereClauses = ['(${idClauses.join(' OR ')})'];
+          final typeColumn = _findColumn(columns, ['local_type', 'Type', 'type']);
+          if (typeColumn != null) {
+            whereClauses.add('${_quoteIdentifier(typeColumn)} = ?');
+            args.add(34);
+          }
+          final timeColumn = _findColumn(columns, ['create_time', 'CreateTime']);
+          if (timeColumn != null && message.createTime != 0) {
+            whereClauses.add('${_quoteIdentifier(timeColumn)} = ?');
+            args.add(message.createTime);
+          }
+
+          final rows = await db.rawQuery(
+            '''
+            SELECT ${blobColumns.map(_quoteIdentifier).join(', ')}
+            FROM ${_quoteIdentifier(tableName)}
+            WHERE ${whereClauses.join(' AND ')}
+            LIMIT 1
+            ''',
+            args,
+          );
+          if (rows.isEmpty) continue;
+
+          for (final column in blobColumns) {
+            final silk = _extractSilkFromValue(rows.first[column]);
+            if (silk != null) return silk;
+          }
+        }
+      } catch (e) {
+        await logger.warning(
+          'DatabaseService',
+          '读取消息语音数据失败: ${PathUtils.escapeForLog(dbPath)}',
+          e,
+        );
+      } finally {
+        await db?.close();
+      }
+    }
+
+    return null;
+  }
+
+  Future<Set<String>> _getTableColumns(Database db, String tableName) async {
+    final rows = await db.rawQuery(
+      'PRAGMA table_info(${_quoteIdentifier(tableName)})',
+    );
+    return rows
+        .map((row) => row['name']?.toString())
+        .whereType<String>()
+        .toSet();
+  }
+
+  String? _findColumn(Set<String> columns, List<String> candidates) {
+    for (final candidate in candidates) {
+      for (final column in columns) {
+        if (column.toLowerCase() == candidate.toLowerCase()) {
+          return column;
+        }
+      }
+    }
+    return null;
+  }
+
+  String _quoteIdentifier(String value) {
+    return '"${value.replaceAll('"', '""')}"';
+  }
+
+  Uint8List? _extractSilkFromValue(Object? raw) {
+    final bytes = _rawValueToBytes(raw);
+    if (bytes == null || bytes.isEmpty) return null;
+    return _extractSilkPayload(bytes);
+  }
+
+  Uint8List? _rawValueToBytes(Object? raw) {
+    if (raw is Uint8List) return raw;
+    if (raw is List<int>) return Uint8List.fromList(raw);
+    if (raw is List) {
+      return Uint8List.fromList(
+        raw.map((e) => int.tryParse(e.toString()) ?? 0).toList(),
+      );
+    }
+    if (raw is String && raw.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is List) {
+          return Uint8List.fromList(
+            decoded.map((e) => int.tryParse(e.toString()) ?? 0).toList(),
+          );
+        }
+      } catch (_) {}
+      return Uint8List.fromList(raw.codeUnits.map((e) => e & 0xff).toList());
+    }
+    return null;
+  }
+
+  Uint8List? _extractSilkPayload(Uint8List bytes) {
+    final direct = _sliceFromSilkHeader(bytes);
+    if (direct != null) return direct;
+
+    try {
+      final decoded = Uint8List.fromList(ZstdCodec().decode(bytes));
+      return _sliceFromSilkHeader(decoded);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Uint8List? _sliceFromSilkHeader(Uint8List bytes) {
+    const magic = [0x23, 0x21, 0x53, 0x49, 0x4C, 0x4B, 0x5F, 0x56, 0x33];
+    for (var i = 0; i <= bytes.length - magic.length; i++) {
+      var matched = true;
+      for (var j = 0; j < magic.length; j++) {
+        if (bytes[i + j] != magic[j]) {
+          matched = false;
+          break;
+        }
+      }
+      if (matched) {
+        return Uint8List.fromList(bytes.sublist(i));
+      }
+    }
+    return null;
   }
 
   Future<Uint8List?> fetchVoiceDataByMsgSvrId(int msgSvrId) async {

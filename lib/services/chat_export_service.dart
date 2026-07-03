@@ -907,16 +907,9 @@ class ChatExportService {
       final outputFile = File(PathUtils.join(audioDir.path, fileName));
       final relativePath = '$audioDirName/$fileName';
 
-      if (await outputFile.exists()) {
-        result[_messageAudioKey(msg)] = relativePath;
-        continue;
-      }
-
       Directory? tempDir;
       try {
-        final voiceData = await _databaseService.fetchVoiceDataByMsgSvrId(
-          msg.serverId,
-        );
+        final voiceData = await _databaseService.fetchVoiceSilkData(msg);
         if (voiceData == null || voiceData.isEmpty) {
           await logger.warning(
             'ChatExportService',
@@ -951,6 +944,9 @@ class ChatExportService {
         }
 
         final pcmBytes = await pcmFile.readAsBytes();
+        if (pcmBytes.isEmpty) {
+          throw Exception('silk decode produced empty pcm');
+        }
         await outputFile.writeAsBytes(
           _buildWavBytes(pcmBytes, sampleRate: _voiceSampleRate),
           flush: true,
