@@ -4,7 +4,12 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to build, for example v2.0.11"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -12,11 +17,14 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
 
       - uses: subosito/flutter-action@v2
         with:
@@ -39,9 +47,11 @@ jobs:
       - name: Build Go decrypt DLL
         shell: cmd
         run: |
-          set "CC=%CD%\w64devkit\bin\gcc.exe"
+          set "CC=%GITHUB_WORKSPACE%\w64devkit\bin\gcc.exe"
           set "GOPROXY=https://goproxy.cn,direct"
-          call go_decrypt\build.bat
+          pushd go_decrypt
+          call build.bat
+          popd
 
       - run: flutter clean
       - run: flutter pub get
@@ -50,7 +60,7 @@ jobs:
       - name: Build zip
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = "${{ env.RELEASE_TAG }}"
           $src = "build/windows/x64/runner/Release"
           $zip = "WeTrace-windows-$tag.zip"
           if (!(Test-Path $src)) { dir build/windows -Recurse; throw "build output not found" }
@@ -61,7 +71,7 @@ jobs:
       - name: Build msix
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = "${{ env.RELEASE_TAG }}"
           $v = $tag.TrimStart("v")
           $msixVersion = "$v.0"
 
@@ -85,7 +95,7 @@ jobs:
             const fs = require("fs");
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const tag = context.ref.replace("refs/tags/", "");
+            const tag = process.env.RELEASE_TAG;
             const tags = execSync("git tag --sort=-creatordate").toString().trim().split("\n").filter(Boolean);
             const idx = tags.indexOf(tag);
             const prev = idx >= 0 && idx + 1 < tags.length ? tags[idx + 1] : null;
@@ -113,6 +123,7 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           body_path: RELEASE_NOTES.md
           files: |
             ${{ env.ZIP_NAME }}

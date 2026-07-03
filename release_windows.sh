@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$repo_root"
 
 version="${1:-}"
@@ -18,24 +18,21 @@ tag="v${version#v}"
 
 gh auth status --hostname github.com >/dev/null
 
-git add .github/workflows/windows-release.yml scripts/release_windows.sh
+git add .github/workflows/windows-release.yml release_windows.sh
 if ! git diff --cached --quiet; then
   git commit -m "Prepare Windows release workflow"
 fi
 
 git push origin HEAD
 
-if git rev-parse "$tag" >/dev/null 2>&1; then
-  echo "ERROR: local tag already exists: $tag" >&2
-  exit 1
+if ! git rev-parse "$tag" >/dev/null 2>&1; then
+  git tag "$tag"
 fi
 
-if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
-  echo "ERROR: remote tag already exists: $tag" >&2
-  exit 1
+if ! git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+  git push origin "$tag"
 fi
 
-git tag "$tag"
-git push origin "$tag"
+gh workflow run "Build Windows & Release" --ref "$(git branch --show-current)" -f "release_tag=$tag"
 
 echo "Triggered Windows release workflow with tag: $tag"
