@@ -347,8 +347,27 @@ class _SettingsPageState extends State<SettingsPage>
     if (_keyController.text.trim().isNotEmpty) return;
 
     try {
-      final key = await _wxKeyService.fetchDecryptKey();
-      if (key == null || !mounted || _keyController.text.trim().isNotEmpty) {
+      _showMessage('正在自动获取微信解密密钥...', true);
+      final key = await _wxKeyService.fetchDecryptKey(
+        timeout: const Duration(seconds: 30),
+      );
+      if (key == null) {
+        final reason = _wxKeyService.getLastErrorMessage();
+        await logger.warning(
+          'SettingsPage',
+          '自动获取微信解密密钥失败${reason.isEmpty ? '' : ': $reason'}',
+        );
+        if (mounted && _keyController.text.trim().isEmpty) {
+          _showMessage(
+            reason.isEmpty
+                ? '自动获取微信解密密钥失败，请确认微信已运行并尝试以管理员身份启动'
+                : '自动获取微信解密密钥失败: $reason',
+            false,
+          );
+        }
+        return;
+      }
+      if (!mounted || _keyController.text.trim().isNotEmpty) {
         return;
       }
 
@@ -358,6 +377,9 @@ class _SettingsPageState extends State<SettingsPage>
       _showMessage('已自动获取微信解密密钥', true);
     } catch (e) {
       await logger.warning('SettingsPage', '自动获取微信解密密钥失败', e);
+      if (mounted && _keyController.text.trim().isEmpty) {
+        _showMessage('自动获取微信解密密钥失败: $e', false);
+      }
     }
   }
 

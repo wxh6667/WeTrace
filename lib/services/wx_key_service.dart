@@ -19,7 +19,50 @@ typedef _GetStatusMessageDart =
 typedef _GetLastErrorMsgNative = Pointer<Int8> Function();
 typedef _GetLastErrorMsgDart = Pointer<Int8> Function();
 
+typedef _EnumWindowsProcNative = Int32 Function(IntPtr hwnd, IntPtr lParam);
+typedef _EnumWindowsNative =
+    Int32 Function(
+      Pointer<NativeFunction<_EnumWindowsProcNative>> callback,
+      IntPtr lParam,
+    );
+typedef _EnumWindowsDart =
+    int Function(
+      Pointer<NativeFunction<_EnumWindowsProcNative>> callback,
+      int lParam,
+    );
+typedef _IsWindowVisibleNative = Int32 Function(IntPtr hwnd);
+typedef _IsWindowVisibleDart = int Function(int hwnd);
+typedef _GetWindowThreadProcessIdNative =
+    Uint32 Function(IntPtr hwnd, Pointer<Uint32> processId);
+typedef _GetWindowThreadProcessIdDart =
+    int Function(int hwnd, Pointer<Uint32> processId);
+typedef _OpenProcessNative =
+    IntPtr Function(Uint32 desiredAccess, Int32 inheritHandle, Uint32 processId);
+typedef _OpenProcessDart =
+    int Function(int desiredAccess, int inheritHandle, int processId);
+typedef _QueryFullProcessImageNameNative =
+    Int32 Function(
+      IntPtr process,
+      Uint32 flags,
+      Pointer<Utf16> exeName,
+      Pointer<Uint32> size,
+    );
+typedef _QueryFullProcessImageNameDart =
+    int Function(
+      int process,
+      int flags,
+      Pointer<Utf16> exeName,
+      Pointer<Uint32> size,
+    );
+typedef _CloseHandleNative = Int32 Function(IntPtr handle);
+typedef _CloseHandleDart = int Function(int handle);
+
 class WxKeyService {
+  static const int _processQueryLimitedInformation = 0x1000;
+  static final Set<int> _windowProcessIds = <int>{};
+  static _IsWindowVisibleDart? _isWindowVisibleForCallback;
+  static _GetWindowThreadProcessIdDart? _getWindowThreadProcessIdForCallback;
+
   DynamicLibrary? _library;
   _InitializeHookDart? _initializeHook;
   _PollKeyDataDart? _pollKeyData;
@@ -70,6 +113,7 @@ class WxKeyService {
   }
 
   String getLastErrorMessage() {
+    _drainStatusMessages();
     if (_lastStatusMessage.isNotEmpty) return _lastStatusMessage;
 
     final getLastErrorMsg = _getLastErrorMsg;
@@ -133,11 +177,115 @@ class WxKeyService {
   }
 
   Future<int?> _findWeixinPid() async {
+    final windowPid = _findMainWindowPid();
+    if (windowPid != null) return windowPid;
+
     for (final imageName in ['Weixin.exe', 'WeChat.exe']) {
       final pid = await _findPidByImageName(imageName);
       if (pid != null) return pid;
     }
     return null;
+  }
+
+  int? _findMainWindowPid() {
+    try {
+      final user32 = DynamicLibrary.open('user32.dll');
+      final kernel32 = DynamicLibrary.open('kernel32.dll');
+      final enumWindows = user32
+          .lookup<NativeFunction<_EnumWindowsNative>>('EnumWindows')
+          .asFunction<_EnumWindowsDart>();
+      _isWindowVisibleForCallback = user32
+          .lookup<NativeFunction<_IsWindowVisibleNative>>('IsWindowVisible')
+          .asFunction<_IsWindowVisibleDart>();
+      _getWindowThreadProcessIdForCallback = user32
+          .lookup<NativeFunction<_GetWindowThreadProcessIdNative>>(
+            'GetWindowThreadProcessId',
+          )
+          .asFunction<_GetWindowThreadProcessIdDart>();
+      final openProcess = kernel32
+          .lookup<NativeFunction<_OpenProcessNative>>('OpenProcess')
+          .asFunction<_OpenProcessDart>();
+      final queryFullProcessImageName = kernel32
+          .lookup<NativeFunction<_QueryFullProcessImageNameNative>>(
+            'QueryFullProcessImageNameW',
+          )
+          .asFunction<_QueryFullProcessImageNameDart>();
+      final closeHandle = kernel32
+          .lookup<NativeFunction<_CloseHandleNative>>('CloseHandle')
+          .asFunction<_CloseHandleDart>();
+
+      _windowProcessIds.clear();
+      enumWindows(
+        Pointer.fromFunction<_EnumWindowsProcNative>(_enumWindowsProc, 1),
+        0,
+      );
+
+      for (final pid in _windowProcessIds) {
+        final imageName = _queryProcessImageName(
+          pid,
+          openProcess,
+          queryFullProcessImageName,
+          closeHandle,
+        );
+        if (_isWeChatImageName(imageName)) {
+          return pid;
+        }
+      }
+    } catch (_) {
+      return null;
+    } finally {
+      _isWindowVisibleForCallback = null;
+      _getWindowThreadProcessIdForCallback = null;
+      _windowProcessIds.clear();
+    }
+    return null;
+  }
+
+  static int _enumWindowsProc(int hwnd, int lParam) {
+    try {
+      final isWindowVisible = _isWindowVisibleForCallback;
+      final getWindowThreadProcessId = _getWindowThreadProcessIdForCallback;
+      if (isWindowVisible == null || getWindowThreadProcessId == null) {
+        return 0;
+      }
+      if (isWindowVisible(hwnd) == 0) return 1;
+
+      final processId = calloc<Uint32>();
+      try {
+        getWindowThreadProcessId(hwnd, processId);
+        if (processId.value > 0) {
+          _windowProcessIds.add(processId.value);
+        }
+      } finally {
+        calloc.free(processId);
+      }
+    } catch (_) {
+      return 1;
+    }
+    return 1;
+  }
+
+  String? _queryProcessImageName(
+    int pid,
+    _OpenProcessDart openProcess,
+    _QueryFullProcessImageNameDart queryFullProcessImageName,
+    _CloseHandleDart closeHandle,
+  ) {
+    final handle = openProcess(_processQueryLimitedInformation, 0, pid);
+    if (handle == 0) return null;
+
+    final size = calloc<Uint32>();
+    final buffer = calloc<Utf16>(32768);
+    try {
+      size.value = 32768;
+      final ok = queryFullProcessImageName(handle, 0, buffer, size);
+      if (ok == 0) return null;
+      return p.basename(buffer.toDartString());
+    } finally {
+      calloc.free(buffer);
+      calloc.free(size);
+      closeHandle(handle);
+    }
   }
 
   Future<int?> _findPidByImageName(String imageName) async {
@@ -155,6 +303,11 @@ class WxKeyService {
       return int.tryParse(columns[1]);
     }
     return null;
+  }
+
+  bool _isWeChatImageName(String? imageName) {
+    final normalized = imageName?.toLowerCase();
+    return normalized == 'weixin.exe' || normalized == 'wechat.exe';
   }
 
   List<String> _parseCsvLine(String line) {
